@@ -9,6 +9,10 @@ export type ProjectAnswers = {
   plan: string;
 };
 
+export type CloudCliFeatures = {
+  growthSsoFreeTrialEnabled: boolean;
+};
+
 export type CloudCliConfig = {
   clientId: string;
   baseUrl: string;

@@ -2,7 +2,7 @@ import axios, { type AxiosResponse } from 'axios';
 import fse from 'fs-extra';
 import os from 'os';
 import { apiConfig } from '../config/api';
-import type { CLIContext, CloudCliConfig, TrackPayload } from '../types';
+import type { CLIContext, CloudCliConfig, TrackPayload, CloudCliFeatures } from '../types';
 import { getLocalConfig } from '../config/local';
 
 import packageJson from '../../package.json';
@@ -76,6 +76,10 @@ export type GetProjectResponse = {
   };
 };
 
+export type CreateFreeTrialResponse = {
+  licenseKey: string;
+};
+
 export interface CloudApiService {
   deploy(
     deployInput: {
@@ -96,6 +100,8 @@ export interface CloudApiService {
 
   getUserInfo(): Promise<AxiosResponse>;
 
+  features(): Promise<AxiosResponse<CloudCliFeatures>>;
+
   config(): Promise<AxiosResponse<CloudCliConfig>>;
 
   listProjects(): Promise<AxiosResponse<ListProjectsResponse>>;
@@ -109,6 +115,10 @@ export interface CloudApiService {
   }): Promise<AxiosResponse<ListLinkEnvironmentsResponse>>;
 
   getProject(project: { name: string }): Promise<AxiosResponse<GetProjectResponse>>;
+
+  createFreeTrial(createFreeTrialInput: {
+    strapiVersion: string;
+  }): Promise<AxiosResponse<CreateFreeTrialResponse>>;
 
   track(event: string, payload?: TrackPayload): Promise<AxiosResponse<void>>;
 }
@@ -173,6 +183,24 @@ export async function cloudApiFactory(
 
     getUserInfo() {
       return axiosCloudAPI.get('/user');
+    },
+
+    async features(): Promise<AxiosResponse<CloudCliFeatures>> {
+      try {
+        const response = await axiosCloudAPI.get('/features');
+
+        if (response.status !== 200) {
+          throw new Error('Error fetching cloud CLI config from the server.');
+        }
+
+        return response;
+      } catch (error) {
+        logger.debug(
+          "🥲 Oops! Couldn't retrieve the CLI config from the server. Please try again."
+        );
+
+        throw error;
+      }
     },
 
     async config(): Promise<AxiosResponse<CloudCliConfig>> {
@@ -274,6 +302,21 @@ export async function cloudApiFactory(
         logger.debug(
           "🥲 Oops! There was a problem retrieving your project's details. Please try again."
         );
+        throw error;
+      }
+    },
+
+    async createFreeTrial({ strapiVersion }): Promise<AxiosResponse<CreateFreeTrialResponse>> {
+      try {
+        const response = await axiosCloudAPI.post(`/cms-trial-request`, { strapiVersion });
+
+        if (response.status !== 200) {
+          throw new Error('Error creating free trial.');
+        }
+
+        return response;
+      } catch (error) {
+        logger.debug('🥲 Oops! There was a problem creating your free trial. Please try again.');
         throw error;
       }
     },

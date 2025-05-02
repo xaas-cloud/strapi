@@ -118,8 +118,9 @@ async function run(args: string[]): Promise<void> {
 
   const rootPath = await checkInstallPath(appDirectory);
 
+  let shouldCreateGrowthSsoFreeTrial = false;
   if (!options.skipCloud) {
-    await handleCloudLogin();
+    shouldCreateGrowthSsoFreeTrial = await handleCloudLogin();
   }
 
   const tmpPath = join(os.tmpdir(), `strapi${crypto.randomBytes(6).toString('hex')}`);
@@ -155,6 +156,7 @@ async function run(args: string[]): Promise<void> {
       'react-router-dom': '^6.0.0',
       'styled-components': '^6.0.0',
     },
+    shouldCreateGrowthSsoFreeTrial,
   };
 
   if (options.template !== undefined) {

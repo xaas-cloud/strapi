@@ -4,6 +4,8 @@ import chalk from 'chalk';
 import execa from 'execa';
 import fse from 'fs-extra';
 
+import { createGrowthSsoFreeTrial } from '@strapi/cloud-cli';
+
 import { copyTemplate } from './utils/template';
 import { tryGitInit } from './utils/git';
 import { trackUsage } from './utils/usage';
@@ -101,6 +103,19 @@ async function createApp(scope: Scope) {
   } catch (err) {
     await fse.remove(rootPath);
     throw err;
+  }
+
+  // Create and save a growth sso free trial license
+  if (scope.shouldCreateGrowthSsoFreeTrial) {
+    try {
+      const data = await createGrowthSsoFreeTrial({ strapiVersion: scope.strapiVersion });
+
+      if (data?.license) {
+        fse.writeFile(join(rootPath, 'license.txt'), data.license);
+      }
+    } catch (error) {
+      logger.error('Error while trying to create your free trial. Please try again later.');
+    }
   }
 
   if (installDependencies) {

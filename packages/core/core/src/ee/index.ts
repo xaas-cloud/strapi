@@ -242,6 +242,10 @@ export default Object.freeze({
     return ee.enabled;
   },
 
+  get isTrial() {
+    return ee.licenseInfo.isTrial;
+  },
+
   get seats() {
     return ee.licenseInfo.seats;
   },
