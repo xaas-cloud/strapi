@@ -553,7 +553,11 @@ class ContentSeeder {
     console.log('Seeding relation-dp...');
     const published = [];
     const drafts = [];
-    const { basic, basicDp } = this.results;
+    const { basic, basicDp, relation } = this.results;
+    const morphTargetsFor = (indices) =>
+      (relation || [])
+        .filter((_, j) => indices.includes(j))
+        .map((r) => ({ __type: 'api::relation.relation', id: r.id }));
 
     // Published
     for (let i = 0; i < CONFIG.counts.relationDp.published; i++) {
@@ -572,6 +576,10 @@ class ContentSeeder {
           data: {
             name: `Relation DP Published ${i + 1}`,
             cover: mediaFile?.id ?? null,
+            morphTargets: morphTargetsFor([
+              i % (relation?.length || 1),
+              (i + 1) % (relation?.length || 1),
+            ]),
             oneToOneBasic: relatedDp[0]?.id || null,
             oneToManyBasics: relatedDp.map((b) => b.id),
             manyToOneBasic: relatedDp[0]?.id || null,
@@ -624,6 +632,10 @@ class ContentSeeder {
           data: {
             name: `Relation DP Draft ${i + 1}`,
             cover: mediaFile?.id ?? null,
+            morphTargets: morphTargetsFor([
+              i % (relation?.length || 1),
+              (i + 2) % (relation?.length || 1),
+            ]),
             oneToOneBasic: relatedDp[0]?.id || null,
             oneToManyBasics: relatedDp.map((b) => b.id),
             manyToOneBasic: relatedDp[0]?.id || null,

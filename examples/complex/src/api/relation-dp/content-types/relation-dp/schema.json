@@ -58,6 +58,12 @@
       "relation": "manyToMany",
       "target": "api::basic.basic"
     },
+    "morphTargets": {
+      "type": "relation",
+      "relation": "morphMany",
+      "target": "api::relation.relation",
+      "morphBy": "morph_to_many"
+    },
     "simpleInfo": {
       "type": "component",
       "repeatable": false,

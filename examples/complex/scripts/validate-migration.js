@@ -818,8 +818,41 @@ async function verifyMigrationFixAtDbLevel(strapi) {
       }
     }
 
-    // --- Nested component IDs (Bug 2) ---
+    // --- Source-side morph (universal fix): relation-dp.morphTargets (morphMany) ---
     const relationDpMeta = meta.get('api::relation-dp.relation-dp');
+    const morphTargetsAttr = relationDpMeta?.attributes?.morphTargets;
+    const morphTargetsJoin = morphTargetsAttr?.joinTable;
+    if (morphTargetsJoin?.morphColumn?.idColumn && morphTargetsJoin?.joinColumn?.name) {
+      const morphTable = morphTargetsJoin.name;
+      const sourceCol = morphTargetsJoin.joinColumn.name;
+      const relTable = relationDpMeta.tableName;
+      const relRows = await conn(relTable).select('id', 'published_at');
+      const pubIds = relRows.filter((r) => r.published_at != null).map((r) => r.id);
+      const draftIds = relRows.filter((r) => r.published_at == null).map((r) => r.id);
+      const countPub =
+        pubIds.length === 0
+          ? 0
+          : Number(
+              (await conn(morphTable).whereIn(sourceCol, pubIds).count('* as c').first())?.c ?? 0
+            );
+      const countDraft =
+        draftIds.length === 0
+          ? 0
+          : Number(
+              (await conn(morphTable).whereIn(sourceCol, draftIds).count('* as c').first())?.c ?? 0
+            );
+      const note =
+        countPub > 0 && countDraft > 0
+          ? ' (source-side morph copied to drafts; universal fix verified)'
+          : countPub > 0 && countDraft === 0
+            ? ' (BUG: draft would have 0 without fix)'
+            : '';
+      out.push(
+        `  Morph (relation-dp morphTargets, source-side): ${countPub} published, ${countDraft} draft${note}.`
+      );
+    }
+
+    // --- Nested component IDs (Bug 2) ---
     const sectionsAttr = relationDpMeta?.attributes?.sections;
     const dzJoin = sectionsAttr?.joinTable;
     if (

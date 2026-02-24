@@ -233,12 +233,18 @@ async function copyRelationsToDrafts({ db, trx, uid }: { db: Database; trx: Knex
     publishedToDraftMap,
   });
 
-  // Copy media morph rows (files_related_morphs) so draft entities have the same media as published
+  // (1) Media: one shared table owned by upload plugin; we are the "related" side (related_id).
+  //    Copy rows so draft entity ids get the same file links as their published pair.
   await copyMediaMorphToDraftsForContentType({ trx, uid, publishedToDraftMap });
+
+  // (2) Other morph: per-attribute tables where we are the "source" side (join column = our entity id).
+  //    Copy rows so draft entity ids get the same polymorphic links. Skips upload table by name.
+  await copySourceSideMorphRelationsForContentType({ trx, uid, publishedToDraftMap });
 }
 
 /**
- * Returns the upload plugin's morph join table info (files_related_morphs) if present.
+ * Returns the upload plugin's morph join table info (e.g. files_related_morphs) if present.
+ * This is the single table used by all media fields across content types and components.
  */
 function getUploadMorphTableInfo(): {
   tableName: string;
@@ -264,105 +270,96 @@ function getUploadMorphTableInfo(): {
 }
 
 /**
- * Copy morph table rows for draft entities: for each (originalId, draftId) in idMap,
- * duplicate rows where related_id = originalId and related_type = relatedType to related_id = draftId.
+ * Unified morph copy: duplicate rows in a morph join table, rewriting one column from original ids to draft ids.
+ * Used for both (1) media: upload table, we are "related" side, filter by related_type; (2) other morph: we are "source" side, no filter.
+ * @param columnToRewrite - the column that holds our entity id (related_id in upload table, entity_id in source-side tables).
+ * @param filter - optional: only copy rows where filter.column = filter.value (e.g. related_type = uid for media).
  */
-async function copyMediaMorphRowsForDraftEntities({
+async function copyMorphRowsByIdMap({
   trx,
-  morphInfo,
+  tableName,
+  columnToRewrite,
   idMap,
-  relatedType,
+  filter,
+  contextReason,
 }: {
   trx: Knex;
-  morphInfo: {
-    tableName: string;
-    joinColumnName: string;
-    relatedIdColumnName: string;
-    relatedTypeColumnName: string;
-  };
+  tableName: string;
+  columnToRewrite: string;
   idMap: Map<number, number>;
-  relatedType: string;
+  filter?: { column: string; value: string };
+  contextReason: string;
 }) {
-  if (idMap.size === 0) {
-    return;
-  }
-  const { tableName, relatedIdColumnName, relatedTypeColumnName } = morphInfo;
+  if (idMap.size === 0) return;
   const hasTable = await ensureTableExists(trx, tableName);
-  if (!hasTable) {
-    return;
-  }
+  if (!hasTable) return;
   const originalIds = Array.from(idMap.keys());
   const chunks = chunkArray(originalIds, getBatchSize(trx, 500));
   for (const chunk of chunks) {
-    const rows = await trx(tableName)
-      .select('*')
-      .whereIn(relatedIdColumnName, chunk)
-      .where(relatedTypeColumnName, relatedType);
-    if (rows.length === 0) {
-      continue;
+    let q = trx(tableName).select('*').whereIn(columnToRewrite, chunk);
+    if (filter) {
+      q = q.where(filter.column, filter.value);
     }
+    const rows = await q;
+    if (rows.length === 0) continue;
     const toInsert: Array<Record<string, any>> = [];
     for (const row of rows) {
-      const originalId = normalizeId(row[relatedIdColumnName]);
+      const originalId = normalizeId(row[columnToRewrite]);
       if (originalId == null) continue;
-      const draftId = idMap.get(originalId);
-      if (draftId == null) continue;
+      const newId = idMap.get(originalId);
+      if (newId == null) continue;
       const { id, ...rest } = row;
-      toInsert.push({
-        ...rest,
-        [relatedIdColumnName]: draftId,
-      });
+      toInsert.push({ ...rest, [columnToRewrite]: newId });
     }
     if (toInsert.length > 0) {
       await insertRelationsWithDuplicateHandling({
         trx,
         tableName,
         relations: toInsert,
-        context: { reason: 'media-morph-draft', relatedType },
+        context: { reason: contextReason, tableName },
       });
     }
   }
 }
 
 /**
- * Copy morph table rows for (originalId, draftId) pairs (e.g. cloned components: one original can have multiple clones).
+ * Same as copyMorphRowsByIdMap but for (originalId, draftId) pairs when one original can map to multiple drafts (e.g. cloned components).
  */
-async function copyMediaMorphRowsForDraftEntityPairs({
+async function copyMorphRowsByPairs({
   trx,
-  morphInfo,
+  tableName,
+  columnToRewrite,
   pairs,
-  relatedType,
+  filter,
+  contextReason,
 }: {
   trx: Knex;
-  morphInfo: {
-    tableName: string;
-    joinColumnName: string;
-    relatedIdColumnName: string;
-    relatedTypeColumnName: string;
-  };
+  tableName: string;
+  columnToRewrite: string;
   pairs: Array<{ originalId: number; draftId: number }>;
-  relatedType: string;
+  filter?: { column: string; value: string };
+  contextReason: string;
 }) {
   if (pairs.length === 0) return;
-  const { tableName, relatedIdColumnName, relatedTypeColumnName } = morphInfo;
   const hasTable = await ensureTableExists(trx, tableName);
   if (!hasTable) return;
   const originalIds = [...new Set(pairs.map((p) => p.originalId))];
   const chunks = chunkArray(originalIds, getBatchSize(trx, 500));
   for (const chunk of chunks) {
-    const rows = await trx(tableName)
-      .select('*')
-      .whereIn(relatedIdColumnName, chunk)
-      .where(relatedTypeColumnName, relatedType);
+    let q = trx(tableName).select('*').whereIn(columnToRewrite, chunk);
+    if (filter) {
+      q = q.where(filter.column, filter.value);
+    }
+    const rows = await q;
     if (rows.length === 0) continue;
     const toInsert: Array<Record<string, any>> = [];
     for (const row of rows) {
-      const originalId = normalizeId(row[relatedIdColumnName]);
+      const originalId = normalizeId(row[columnToRewrite]);
       if (originalId == null) continue;
       const draftIds = pairs.filter((p) => p.originalId === originalId).map((p) => p.draftId);
       for (const draftId of draftIds) {
         const { id, ...rest } = row;
-        toInsert.push({ ...rest, [relatedIdColumnName]: draftId });
+        toInsert.push({ ...rest, [columnToRewrite]: draftId });
       }
     }
     if (toInsert.length > 0) {
@@ -370,15 +367,13 @@ async function copyMediaMorphRowsForDraftEntityPairs({
         trx,
         tableName,
         relations: toInsert,
-        context: { reason: 'media-morph-draft-components', relatedType },
+        context: { reason: contextReason, tableName },
       });
     }
   }
 }
 
-/**
- * Copy media morph entries for this content type's published -> draft ids.
- */
+/** Copy media morph rows for this content type (upload table; we are the "related" side). */
 async function copyMediaMorphToDraftsForContentType({
   trx,
   uid,
@@ -389,15 +384,97 @@ async function copyMediaMorphToDraftsForContentType({
   publishedToDraftMap: Map<number, number>;
 }) {
   const morphInfo = getUploadMorphTableInfo();
-  if (!morphInfo) {
-    return;
-  }
-  await copyMediaMorphRowsForDraftEntities({
+  if (!morphInfo) return;
+  await copyMorphRowsByIdMap({
     trx,
-    morphInfo,
+    tableName: morphInfo.tableName,
+    columnToRewrite: morphInfo.relatedIdColumnName,
     idMap: publishedToDraftMap,
-    relatedType: uid,
+    filter: {
+      column: morphInfo.relatedTypeColumnName,
+      value: uid,
+    },
+    contextReason: 'media-morph-draft',
   });
+}
+
+/** Copy source-side morph rows for this content type (per-attribute tables; we are the "source" side). */
+async function copySourceSideMorphRelationsForContentType({
+  trx,
+  uid,
+  publishedToDraftMap,
+}: {
+  trx: Knex;
+  uid: string;
+  publishedToDraftMap: Map<number, number>;
+}) {
+  const meta = strapi.db.metadata.get(uid);
+  if (!meta) return;
+  const uploadMorph = getUploadMorphTableInfo();
+  const uploadTableName = uploadMorph?.tableName ?? null;
+
+  for (const attribute of Object.values(meta.attributes) as any[]) {
+    if (attribute.type !== 'relation' || !attribute.joinTable?.morphColumn) continue;
+    const joinTable = attribute.joinTable;
+    if (joinTable.name === uploadTableName) continue;
+    const sourceColumnName = joinTable.joinColumn?.name;
+    if (!sourceColumnName) continue;
+
+    await copyMorphRowsByIdMap({
+      trx,
+      tableName: joinTable.name,
+      columnToRewrite: sourceColumnName,
+      idMap: publishedToDraftMap,
+      contextReason: 'source-side-morph-draft',
+    });
+  }
+}
+
+/**
+ * Copy source-side morph relations for cloned components (each component type's morph attributes).
+ */
+async function copySourceSideMorphRelationsForClonedComponents({
+  trx,
+  componentCloneCache,
+}: {
+  trx: Knex;
+  componentCloneCache: Map<string, Map<string, number>>;
+}) {
+  const uploadMorph = getUploadMorphTableInfo();
+  const uploadTableName = uploadMorph?.tableName ?? null;
+
+  for (const [componentType, cloneMap] of componentCloneCache.entries()) {
+    let componentMeta: any;
+    try {
+      componentMeta = strapi.db.metadata.get(componentType);
+    } catch {
+      continue;
+    }
+    for (const attribute of Object.values(componentMeta.attributes || {}) as any[]) {
+      if (attribute.type !== 'relation' || !attribute.joinTable?.morphColumn) continue;
+      const joinTable = attribute.joinTable;
+      if (joinTable.name === uploadTableName) continue;
+      const sourceColumnName = joinTable.joinColumn?.name;
+      if (!sourceColumnName) continue;
+
+      const pairs: Array<{ originalId: number; draftId: number }> = [];
+      for (const [key, newComponentId] of cloneMap.entries()) {
+        const originalId = Number(key.split(':')[0]);
+        if (!Number.isNaN(originalId)) {
+          pairs.push({ originalId, draftId: newComponentId });
+        }
+      }
+      if (pairs.length > 0) {
+        await copyMorphRowsByPairs({
+          trx,
+          tableName: joinTable.name,
+          columnToRewrite: sourceColumnName,
+          pairs,
+          contextReason: 'source-side-morph-draft-pairs',
+        });
+      }
+    }
+  }
 }
 
 /**
@@ -3180,15 +3257,26 @@ async function copyComponentRelations({
           }
         }
         if (pairs.length > 0) {
-          await copyMediaMorphRowsForDraftEntityPairs({
+          await copyMorphRowsByPairs({
             trx,
-            morphInfo,
+            tableName: morphInfo.tableName,
+            columnToRewrite: morphInfo.relatedIdColumnName,
             pairs,
-            relatedType: componentType,
+            filter: {
+              column: morphInfo.relatedTypeColumnName,
+              value: componentType,
+            },
+            contextReason: 'media-morph-draft-components',
           });
         }
       }
     }
+
+    // Copy any other morph relations where cloned components are the source (morphToOne/morphToMany)
+    await copySourceSideMorphRelationsForClonedComponents({
+      trx,
+      componentCloneCache,
+    });
   }
 }
 
