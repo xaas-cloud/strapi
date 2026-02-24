@@ -170,6 +170,16 @@ const components = {
     headerlogo: logoComponent,
   }),
 
+  reference: (articleId) => ({
+    label: `Ref ${random.string()}`,
+    article: articleId || null,
+  }),
+
+  referenceList: (references = []) => ({
+    title: `RefList ${random.string()}`,
+    references: Array.isArray(references) ? references : [references],
+  }),
+
   // Dynamic zone wrappers
   forDynamicZone: (component, type) => ({
     __component: `shared.${type}`,
@@ -561,6 +571,7 @@ class ContentSeeder {
         const entry = await this.strapi.entityService.create('api::relation-dp.relation-dp', {
           data: {
             name: `Relation DP Published ${i + 1}`,
+            cover: mediaFile?.id ?? null,
             oneToOneBasic: relatedDp[0]?.id || null,
             oneToManyBasics: relatedDp.map((b) => b.id),
             manyToOneBasic: relatedDp[0]?.id || null,
@@ -612,6 +623,7 @@ class ContentSeeder {
         const entry = await this.strapi.entityService.create('api::relation-dp.relation-dp', {
           data: {
             name: `Relation DP Draft ${i + 1}`,
+            cover: mediaFile?.id ?? null,
             oneToOneBasic: relatedDp[0]?.id || null,
             oneToManyBasics: relatedDp.map((b) => b.id),
             manyToOneBasic: relatedDp[0]?.id || null,
@@ -652,6 +664,39 @@ class ContentSeeder {
         data: {
           selfOne: entry.id,
           selfMany: [entry.id],
+        },
+      });
+    }
+
+    // Add nested component with relations (reference-list -> references -> article) to first published entry for migration test
+    if (published.length >= 2) {
+      const relatedDpForFirst = [
+        this.pick(basicDp?.published, 0),
+        this.pick(basicDp?.drafts, 0),
+      ].filter(Boolean);
+      const mediaFileForFirst = this.pick(this.mediaFiles, 0);
+      const logoForFirst = mediaFileForFirst ? components.logo(mediaFileForFirst.id) : null;
+      const headerForFirst = logoForFirst ? components.header(logoForFirst) : null;
+      const refListSection = components.forDynamicZone(
+        components.referenceList([
+          components.reference(published[1]?.id),
+          components.reference(published[0]?.id),
+        ]),
+        'reference-list'
+      );
+      await this.strapi.entityService.update('api::relation-dp.relation-dp', published[0].id, {
+        data: {
+          sections: [
+            components.forDynamicZone(
+              components.textBlock({ basicDpId: relatedDpForFirst[0]?.id }),
+              'text-block'
+            ),
+            components.forDynamicZone(components.mediaBlock(), 'media-block'),
+            ...(headerForFirst
+              ? [components.forDynamicZone(components.header(logoForFirst), 'header')]
+              : []),
+            refListSection,
+          ],
         },
       });
     }

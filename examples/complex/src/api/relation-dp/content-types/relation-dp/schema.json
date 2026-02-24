@@ -13,6 +13,11 @@
     "name": {
       "type": "string"
     },
+    "cover": {
+      "type": "media",
+      "multiple": false,
+      "allowedTypes": ["images"]
+    },
     "selfOne": {
       "type": "relation",
       "relation": "oneToOne",
@@ -74,7 +79,12 @@
     },
     "sections": {
       "type": "dynamiczone",
-      "components": ["shared.text-block", "shared.media-block", "shared.header"]
+      "components": [
+        "shared.text-block",
+        "shared.media-block",
+        "shared.header",
+        "shared.reference-list"
+      ]
     },
     "header": {
       "type": "component",
