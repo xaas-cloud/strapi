@@ -47,6 +47,29 @@ type MetadataWithOptionalPrimaryKey = {
   attributes?: Record<string, unknown>;
 };
 
+const resolveComponentMetadataUidCandidates = (componentUid: string) => {
+  if (componentUid.startsWith('component::')) {
+    return [componentUid, componentUid.slice('component::'.length)];
+  }
+
+  return [componentUid, `component::${componentUid}`];
+};
+
+const getComponentMetadataByUid = (componentUid: string) => {
+  for (const candidate of resolveComponentMetadataUidCandidates(componentUid)) {
+    try {
+      const meta = strapi.db.metadata.get(candidate);
+      if (meta) {
+        return meta;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+};
+
 const DEFAULT_PRIMARY_KEY_COLUMN = 'id';
 
 type AttributeWithPrimaryFlag = {
@@ -257,15 +280,18 @@ function getUploadMorphTableInfo(): {
     return null;
   }
   const relatedAttr = (fileMeta.attributes as Record<string, any>).related;
-  if (!relatedAttr?.joinTable?.morphColumn) {
+  const joinTable = relatedAttr?.joinTable;
+  const morphColumn = joinTable?.morphColumn ?? relatedAttr?.morphColumn;
+
+  if (!joinTable?.name || !joinTable?.joinColumn?.name || !morphColumn) {
     return null;
   }
-  const joinTable = relatedAttr.joinTable;
+
   return {
     tableName: joinTable.name,
     joinColumnName: joinTable.joinColumn.name,
-    relatedIdColumnName: joinTable.morphColumn.idColumn.name,
-    relatedTypeColumnName: joinTable.morphColumn.typeColumn.name,
+    relatedIdColumnName: morphColumn.idColumn.name,
+    relatedTypeColumnName: morphColumn.typeColumn.name,
   };
 }
 
@@ -373,6 +399,27 @@ async function copyMorphRowsByPairs({
   }
 }
 
+type ClonedComponentPairsCache = Map<string, Map<string, number>>;
+
+const recordClonedComponentPair = (
+  clonedComponentPairsCache: ClonedComponentPairsCache | undefined,
+  componentUid: string,
+  originalId: number,
+  draftId: number
+) => {
+  if (!clonedComponentPairsCache) {
+    return;
+  }
+
+  let pairMap = clonedComponentPairsCache.get(componentUid);
+  if (!pairMap) {
+    pairMap = new Map();
+    clonedComponentPairsCache.set(componentUid, pairMap);
+  }
+
+  pairMap.set(`${originalId}:${draftId}`, draftId);
+};
+
 /** Copy media morph rows for this content type (upload table; we are the "related" side). */
 async function copyMediaMorphToDraftsForContentType({
   trx,
@@ -417,6 +464,9 @@ async function copySourceSideMorphRelationsForContentType({
     if (attribute.type !== 'relation' || !attribute.joinTable?.morphColumn) continue;
     const joinTable = attribute.joinTable;
     if (joinTable.name === uploadTableName) continue;
+    // Dynamic zones are represented as morph relations in DB metadata, but their rows live in
+    // the shared component join table (`*_cmps`) and are already handled by copyComponentRelations.
+    if (joinTable.name.includes('_cmps')) continue;
     const sourceColumnName = joinTable.joinColumn?.name;
     if (!sourceColumnName) continue;
 
@@ -435,18 +485,18 @@ async function copySourceSideMorphRelationsForContentType({
  */
 async function copySourceSideMorphRelationsForClonedComponents({
   trx,
-  componentCloneCache,
+  clonedComponentPairsCache,
 }: {
   trx: Knex;
-  componentCloneCache: Map<string, Map<string, number>>;
+  clonedComponentPairsCache: ClonedComponentPairsCache;
 }) {
   const uploadMorph = getUploadMorphTableInfo();
   const uploadTableName = uploadMorph?.tableName ?? null;
 
-  for (const [componentType, cloneMap] of componentCloneCache.entries()) {
+  for (const [componentType, cloneMap] of clonedComponentPairsCache.entries()) {
     let componentMeta: any;
     try {
-      componentMeta = strapi.db.metadata.get(componentType);
+      componentMeta = getComponentMetadataByUid(componentType);
     } catch {
       continue;
     }
@@ -454,6 +504,9 @@ async function copySourceSideMorphRelationsForClonedComponents({
       if (attribute.type !== 'relation' || !attribute.joinTable?.morphColumn) continue;
       const joinTable = attribute.joinTable;
       if (joinTable.name === uploadTableName) continue;
+      // Component dynamic zones also use `*_cmps` join tables and are cloned recursively.
+      // Copying them here would reinsert original component ids and create shared draft/published rows.
+      if (joinTable.name.includes('_cmps')) continue;
       const sourceColumnName = joinTable.joinColumn?.name;
       if (!sourceColumnName) continue;
 
@@ -1189,7 +1242,7 @@ async function findComponentParentInstance(
  */
 const getComponentMeta = (componentUid: string) => {
   if (!componentMetaCache.has(componentUid)) {
-    const meta = strapi.db.metadata.get(componentUid);
+    const meta = getComponentMetadataByUid(componentUid);
     componentMetaCache.set(componentUid, meta ?? null);
   }
 
@@ -1483,6 +1536,19 @@ async function cloneComponentRelationJoinTables(
       continue;
     }
 
+    const rawComponentAttribute = (
+      strapi.components[componentUid as keyof typeof strapi.components] as any
+    )?.attributes?.[attributeName];
+
+    // Component and dynamic zone links need deep cloning of target component rows.
+    // Skip the generic join-table copier so the recursive clone path can handle them.
+    if (
+      rawComponentAttribute?.type === 'component' ||
+      rawComponentAttribute?.type === 'dynamiczone'
+    ) {
+      continue;
+    }
+
     const joinTable = attribute.joinTable;
     const sourceColumnName = joinTable.joinColumn.name;
     const targetColumnName = joinTable.inverseJoinColumn.name;
@@ -1596,6 +1662,7 @@ async function cloneComponentInstance({
   parentUid,
   parentPublishedToDraftMap,
   draftMapCache,
+  clonedComponentPairsCache,
   isForDraftEntity = true,
   reverseMapCache,
 }: {
@@ -1605,6 +1672,7 @@ async function cloneComponentInstance({
   parentUid: string;
   parentPublishedToDraftMap: Map<number, number>;
   draftMapCache: Map<string, Map<number, number> | null>;
+  clonedComponentPairsCache?: ClonedComponentPairsCache;
   isForDraftEntity?: boolean;
   reverseMapCache?: Map<string, Map<number, number> | null>;
 }): Promise<number> {
@@ -1706,6 +1774,13 @@ async function cloneComponentInstance({
     throw new Error(`Invalid cloned component identifier for ${componentUid} (id: ${componentId})`);
   }
 
+  recordClonedComponentPair(
+    clonedComponentPairsCache,
+    componentUid,
+    Number(componentPrimaryKey),
+    newComponentId
+  );
+
   await cloneComponentRelationJoinTables(
     trx,
     componentMeta,
@@ -1722,14 +1797,16 @@ async function cloneComponentInstance({
   // Clone nested components (component and dynamiczone attributes) so draft has its own copy
   const componentSchema = strapi.components[componentUid as keyof typeof strapi.components] as any;
   const collectionName = componentSchema?.collectionName;
-  if (collectionName) {
+  if (collectionName && componentSchema?.attributes) {
     const identifiers = strapi.db.metadata.identifiers;
     const entityIdCol = getComponentJoinColumnEntityName(identifiers);
     const componentIdCol = getComponentJoinColumnInverseName(identifiers);
     const componentTypeCol = getComponentTypeColumn(identifiers);
     const fieldCol = identifiers.FIELD_COLUMN;
 
-    for (const [attrName, attr] of Object.entries(componentMeta.attributes || {}) as Array<
+    // Use the raw component schema here: DB metadata transforms component/DZ attrs into relations,
+    // so their original `type` values are only available on the schema definition.
+    for (const [attrName, attr] of Object.entries(componentSchema.attributes || {}) as Array<
       [string, any]
     >) {
       if (attr.type === 'component') {
@@ -1750,6 +1827,7 @@ async function cloneComponentInstance({
             parentUid: componentUid,
             parentPublishedToDraftMap,
             draftMapCache,
+            clonedComponentPairsCache,
             isForDraftEntity,
             reverseMapCache,
           });
@@ -1778,6 +1856,7 @@ async function cloneComponentInstance({
             parentUid: componentUid,
             parentPublishedToDraftMap,
             draftMapCache,
+            clonedComponentPairsCache,
             isForDraftEntity,
             reverseMapCache,
           });
@@ -2650,7 +2729,7 @@ async function fixExistingDraftComponentRelations({ trx, uid }: { trx: Knex; uid
     const draftMapCache = new Map<string, Map<number, number> | null>();
 
     for (const componentType of componentTypes) {
-      const componentMeta = strapi.db.metadata.get(componentType);
+      const componentMeta = getComponentMetadataByUid(componentType);
       if (!componentMeta) continue;
 
       for (const [, attr] of Object.entries(componentMeta.attributes || {}) as Array<
@@ -2872,7 +2951,7 @@ async function fixPublishedComponentRelationTargets({ trx, uid }: { trx: Knex; u
   }
 
   for (const [componentType, componentIds] of typeToIds.entries()) {
-    const componentMeta = strapi.db.metadata.get(componentType);
+    const componentMeta = getComponentMetadataByUid(componentType);
     if (!componentMeta) continue;
     const ids = Array.from(componentIds);
     if (ids.length === 0) continue;
@@ -3019,6 +3098,7 @@ async function copyComponentRelations({
     }
 
     const componentCloneCache = new Map<string, Map<string, number>>();
+    const clonedComponentPairsCache: ClonedComponentPairsCache = new Map();
     const componentTargetDraftMapCache = new Map<string, Map<number, number> | null>();
     const componentTargetReverseMapCache = new Map<string, Map<number, number> | null>();
     const componentHierarchyCaches: ComponentHierarchyCaches = {
@@ -3141,6 +3221,7 @@ async function copyComponentRelations({
               parentUid: uid,
               parentPublishedToDraftMap: publishedToDraftMap,
               draftMapCache: componentTargetDraftMapCache,
+              clonedComponentPairsCache,
               isForDraftEntity: true,
               reverseMapCache: componentTargetReverseMapCache,
             });
@@ -3248,7 +3329,7 @@ async function copyComponentRelations({
     // Copy media morph rows for cloned components so draft components have the same media as published
     const morphInfo = getUploadMorphTableInfo();
     if (morphInfo) {
-      for (const [componentType, cloneMap] of componentCloneCache.entries()) {
+      for (const [componentType, cloneMap] of clonedComponentPairsCache.entries()) {
         const pairs: Array<{ originalId: number; draftId: number }> = [];
         for (const [key, newComponentId] of cloneMap.entries()) {
           const originalId = Number(key.split(':')[0]);
@@ -3275,7 +3356,7 @@ async function copyComponentRelations({
     // Copy any other morph relations where cloned components are the source (morphToOne/morphToMany)
     await copySourceSideMorphRelationsForClonedComponents({
       trx,
-      componentCloneCache,
+      clonedComponentPairsCache,
     });
   }
 }

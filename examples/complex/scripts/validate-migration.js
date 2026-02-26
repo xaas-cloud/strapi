@@ -652,6 +652,7 @@ async function validateNestedComponentRelationParity(strapi) {
  */
 async function verifyMigrationFixAtDbLevel(strapi) {
   const out = [];
+  const errors = [];
   try {
     const conn = strapi.db.connection;
     const meta = strapi.db.metadata;
@@ -879,13 +880,33 @@ async function verifyMigrationFixAtDbLevel(strapi) {
 
       let docsWithRefList = 0;
       let docsWithDistinctCmpIds = 0;
+      let docsWithDz = 0;
+      let docsWithOverlap = 0;
       const refListType = 'shared.reference-list';
-      for (const [, pair] of byDoc.entries()) {
+      for (const [docId, pair] of byDoc.entries()) {
         if (!pair.published || !pair.draft) continue;
-        const refRows = await conn(joinTableName)
-          .where(componentTypeCol, refListType)
+        const dzRows = await conn(joinTableName)
           .whereIn(entityIdCol, [pair.published, pair.draft])
-          .select(entityIdCol, componentIdCol);
+          .select(entityIdCol, componentIdCol, componentTypeCol);
+        const pubDz = new Set(
+          dzRows
+            .filter((row) => row[entityIdCol] === pair.published)
+            .map((row) => row[componentIdCol])
+        );
+        const draftDz = new Set(
+          dzRows.filter((row) => row[entityIdCol] === pair.draft).map((row) => row[componentIdCol])
+        );
+        if (pubDz.size === 0 && draftDz.size === 0) continue;
+        docsWithDz += 1;
+        const overlaps = [...pubDz].filter((id) => draftDz.has(id));
+        if (overlaps.length > 0) {
+          docsWithOverlap += 1;
+          errors.push(
+            `relation-dp documentId ${docId}: ${overlaps.length} dynamic-zone component id(s) shared between published and draft`
+          );
+        }
+
+        const refRows = dzRows.filter((row) => row[componentTypeCol] === refListType);
         const pubCmps = new Set(
           refRows
             .filter((row) => row[entityIdCol] === pair.published)
@@ -900,13 +921,16 @@ async function verifyMigrationFixAtDbLevel(strapi) {
         if (disjoint && pubCmps.size > 0) docsWithDistinctCmpIds += 1;
       }
       out.push(
-        `  Nested components: ${docsWithRefList} document(s) with reference-list; ${docsWithDistinctCmpIds} have distinct draft vs published component IDs (cloned correctly).`
+        `  Nested components: ${docsWithRefList} document(s) with reference-list; ${docsWithDistinctCmpIds} have distinct draft vs published component IDs.`
+      );
+      out.push(
+        `  Dynamic zone components: ${docsWithDz} document(s); ${docsWithOverlap} have overlapping component IDs.`
       );
     }
   } catch (e) {
     out.push(`  Verification skipped (${e.message}).`);
   }
-  return out;
+  return { lines: out, errors };
 }
 
 async function validateRelationParityForDp(strapi, uid) {
@@ -1015,6 +1039,15 @@ async function run() {
       errors: nestedComponentParity.errors,
     });
 
+    // Optional DB-level verification (evidence that migration fixes are in effect)
+    const verification = await verifyMigrationFixAtDbLevel(strapi);
+    if (verification.errors.length > 0) {
+      results.errors.push(...verification.errors);
+      results.sections.push({ name: 'DB-level verification', errors: verification.errors });
+    } else {
+      results.sections.push({ name: 'DB-level verification', errors: [] });
+    }
+
     // Summarize
     console.log('\n✅ Validation summary:');
     if (results.errors.length === 0) {
@@ -1038,13 +1071,9 @@ async function run() {
       console.log(`  - ${section.name}: ${status}`);
     }
 
-    // Optional DB-level verification (evidence that migration fixes are in effect)
-    if (results.errors.length === 0) {
-      const verificationLines = await verifyMigrationFixAtDbLevel(strapi);
-      if (verificationLines.length > 0) {
-        console.log('\n🔬 DB-level verification (migration fix evidence):');
-        for (const line of verificationLines) console.log(line);
-      }
+    if (verification.lines.length > 0) {
+      console.log('\n🔬 DB-level verification (migration fix evidence):');
+      for (const line of verification.lines) console.log(line);
     }
 
     process.exit(results.errors.length === 0 ? 0 : 2);
